@@ -201,9 +201,17 @@ local function build()
 	-- since the last stone exceeds STEP_RISE (so the real rise never exceeds
 	-- MAX_RISE = 1.6), with zigzag +-0.6 and the long axis facing uphill. A
 	-- stretch the stones cannot climb (real terrain rise > 1.6 even for the
-	-- next stone) is reported, never bridged with floating stones.
+	-- next stone) gets a carved stone stair: lateral offsets {0, +-3, +-6}
+	-- perpendicular to the path are scanned, the one with the smallest total
+	-- terrain climb is chosen, and treads of rise <= 1.3 are embedded there,
+	-- each extending down to the terrain, the last one flush with the upper
+	-- ledge. Stones then continue across the ledge to the cave mouth (PATH_C).
 	local PATH_A = Vector3.new(-62, 0, 207)
 	local PATH_B = Vector3.new(-94, 0, 214)
+	local PATH_C = Vector3.new(-94, 0, 221) -- cave mouth on the upper ledge
+	local ledgeVec = PATH_C - PATH_B
+	local ledgeLen = math.sqrt(ledgeVec.X * ledgeVec.X + ledgeVec.Z * ledgeVec.Z)
+	local ledgeDir = Vector3.new(ledgeVec.X / ledgeLen, 0, ledgeVec.Z / ledgeLen)
 	local pathVec = PATH_B - PATH_A
 	local pathLen = math.sqrt(pathVec.X * pathVec.X + pathVec.Z * pathVec.Z)
 	local dirU = Vector3.new(pathVec.X / pathLen, 0, pathVec.Z / pathLen)
@@ -212,8 +220,10 @@ local function build()
 	local PROBE = 0.75 -- terrain probe spacing (stones can be this close together)
 	local MAX_RISE = 1.6 -- hard cap on the climb between consecutive stones
 	local STEP_RISE = 1.0 -- place a stone once the climb since the last exceeds this
+	local MAX_PARTS = 35 -- hard cap on total Cave18 BaseParts
+	local STAIR_RISE = 1.3 -- max rise between consecutive stair treads
+	local TREAD_W, TREAD_D = 2.6, 1.5 -- stair tread: width across, depth along
 	local MAX_GAP = 6 -- never leave more than ~6 studs of path without a stone
-	local MAX_STONE_GAP_DROPPED = 3 -- probes to skip while waiting out a steep wall
 
 	local rng = Random.new(1818)
 
@@ -222,6 +232,8 @@ local function build()
 	local function placeStone(x, z, maxY)
 		if stonesPlaced >= MAX_STONES then
 			return nil, "stone budget exhausted"
+		elseif partsCreated >= MAX_PARTS then
+			return nil, "part budget exhausted"
 		end
 		local hit = groundHit(x, z, 60, 300)
 		if not hit then
@@ -300,34 +312,93 @@ local function build()
 					end
 				end
 				if not placed and not budgetOut then
-					-- genuinely unclimbable wall: report it, then wait (skipping
-					-- probes) for terrain back within one max rise of the last stone
-					table.insert(problems, string.format(
-						"s%.1f-%.1f too steep: terrain rises %.1f > %.1f", lastS, s, climb, MAX_RISE))
-					local skipped = 0
-					while k < nProbes and skipped < MAX_STONE_GAP_DROPPED do
-						k = k + 1
-						skipped = skipped + 1
-						s = math.min(k * PROBE, pathLen)
-						zig = (k % 2 == 0) and 0.6 or -0.6
-						p = PATH_A + dirU * s + perpU * zig
-						hit = groundHit(p.X, p.Z, 60, 300)
-						if hit and hit.Material ~= Enum.Material.Water and hit.Normal.Y >= 0.55
-							and hit.Position.Y <= lastY + MAX_RISE then
-							y = hit.Position.Y
-							break
+					-- Genuinely unclimbable wall: carve a stone stair. Scan the
+					-- lateral offsets {0, +-3, +-6} perpendicular to the path
+					-- and pick the one whose terrain has the smallest total
+					-- climb across the remaining path.
+					local bestOff, bestRise = nil, nil
+					for _, off in ipairs({ 0, 3, -3, 6, -6 }) do
+						local prevTy, total, ok = nil, 0, true
+						for m = 0, math.ceil((pathLen - lastS) / 0.75) do
+							local ss = lastS + m * 0.75
+							local pp = PATH_A + dirU * ss + perpU * off
+							local hh = groundHit(pp.X, pp.Z, 60, 300)
+							if not hh or hh.Material == Enum.Material.Water then
+								ok = false
+								break
+							end
+							if prevTy and hh.Position.Y > prevTy then
+								total = total + (hh.Position.Y - prevTy)
+							end
+							prevTy = hh.Position.Y
+						end
+						if ok and (bestRise == nil or total < bestRise) then
+							bestRise, bestOff = total, off
 						end
 					end
-					if y == nil or y > lastY + MAX_RISE then
-						budgetOut = true -- never got back in reach; stop, path reported
-						table.insert(problems, string.format("path beyond s%.1f: still too steep", lastS))
+					if bestOff == nil then
+						budgetOut = true
+						table.insert(problems, string.format(
+							"path beyond s%.1f: no walkable lateral line for a stair", lastS))
 						break
 					end
-					local sy, why = placeStone(p.X, p.Z, lastY + MAX_RISE)
-					if sy then
-						lastY, lastS = sy, s
-					elseif why == "stone budget exhausted" then
+					local endP = PATH_A + dirU * pathLen + perpU * bestOff
+					local endHit = groundHit(endP.X, endP.Z, 60, 300)
+					if not endHit then
 						budgetOut = true
+						table.insert(problems, "path end: no terrain for the stair to land on")
+						break
+					end
+					local targetY = endHit.Position.Y
+					local prevTop = lastY
+					local sCur = lastS
+					local tread = 0
+					while partsCreated < MAX_PARTS do
+						sCur = sCur + TREAD_D
+						if sCur - pathLen > 6 then
+							-- not enough run to reach the ledge at <=1.3 per tread
+							table.insert(problems, string.format(
+								"stair from s%.1f: ran out of run %.1f short of the ledge",
+								lastS, targetY - prevTop))
+							break
+						end
+						local top = math.min(prevTop + STAIR_RISE, targetY)
+						local sp
+						if sCur <= pathLen then
+							sp = PATH_A + dirU * sCur + perpU * bestOff
+						else
+							-- the stair tops out past the path end: keep climbing
+							-- toward the cave mouth along the ledge, tapering the
+							-- lateral offset back to the ledge centreline
+							local e = sCur - pathLen
+							sp = PATH_B + ledgeDir * e + perpU * (bestOff * math.max(0, 1 - e / 3))
+						end
+						local hh = groundHit(sp.X, sp.Z, 60, 300)
+						if not hh then
+							table.insert(problems, "stair tread: no terrain hit")
+							break
+						end
+						-- each tread extends DOWN to the terrain so nothing floats
+						-- (clamped to a 0.5 slab where the rock face buries it)
+						local height = math.max(0.5, top - hh.Position.Y + 0.5)
+						tread = tread + 1
+						local shade = rng:NextInteger(-8, 8)
+						local yaw = uphillYaw + math.rad(rng:NextNumber(-3, 3))
+						addPart(Enum.PartType.Block, "CaveStair" .. tread,
+							Vector3.new(TREAD_W, height, TREAD_D),
+							CFrame.new(sp.X, top - height / 2, sp.Z) * CFrame.Angles(0, yaw, 0),
+							Color3.fromRGB(132 + shade, 130 + shade, 120 + shade), SLATE)
+						table.insert(stoneYs, string.format("%.1f", top))
+						prevTop = top
+						lastY, lastS = top, sCur
+						if top >= targetY - 0.01 then
+							break -- last tread flush with the ledge surface
+						end
+					end
+					if partsCreated >= MAX_PARTS then
+						budgetOut = true
+						table.insert(problems, "stair stopped: part budget exhausted")
+						break
 					end
 				end
 			elseif climb > STEP_RISE or (s - lastS) > MAX_GAP or k == nProbes then
@@ -344,6 +415,28 @@ local function build()
 	end
 	if budgetOut and stonesPlaced >= MAX_STONES then
 		table.insert(problems, string.format("path beyond s%.1f: stone budget exhausted", lastS or 0))
+	end
+
+	-- 4) Ledge stones: from wherever the path/stair topped out (PATH_B is the
+	-- end of the ramp path, PATH_C the cave mouth), continue flat stepping
+	-- stones toward the mouth until the part or stone budget runs out.
+	local ledgeStep = 0
+	if lastY ~= nil then
+		local ls = 0
+		while ls < ledgeLen and partsCreated < MAX_PARTS and stonesPlaced < MAX_STONES do
+			ls = ls + 2
+			ledgeStep = ledgeStep + 1
+			local lp = PATH_B + ledgeDir * ls + perpU * (ledgeStep % 2 == 0 and 0.5 or -0.5)
+			local sy, why = placeStone(lp.X, lp.Z, lastY + MAX_RISE)
+			if sy then
+				lastY, lastS = sy, pathLen + ls
+			elseif why == "stone budget exhausted" or why == "part budget exhausted" then
+				break
+			end
+		end
+	end
+	if partsCreated > MAX_PARTS then
+		table.insert(problems, "part budget exceeded")
 	end
 end
 
