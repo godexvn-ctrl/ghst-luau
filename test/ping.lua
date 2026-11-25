@@ -1,0 +1,1 @@
+return "ping-ok " .. tostring(42)
